@@ -1,0 +1,73 @@
+CQ - COMMAND QUEUE
+==================
+
+cq is a command queue. Commands run one at a time, in order.
+It uses zmx as the terminal backend, so you can attach to
+running jobs and see their output.
+
+No daemon. No config. Just queue and go.
+
+
+QUICK START
+
+    $ cq make build          # queue a command
+    queued: [1] [make build]
+
+    $ cq make test           # queue another
+    queued: [2] [make test]
+
+    $ cq list                # see what's going on
+    ID   STATUS     PID      COMMAND
+    2    pending    -        make test
+    1    running    12345    make build
+
+    $ cq attach 1            # attach to running job (full scrollback)
+    $ cq log 1               # just dump the output
+
+
+COMMANDS
+
+    cq <cmd> [args]          queue a command
+    cq attach <id>           attach terminal to running job
+    cq kill <id>             kill a running job
+    cq list                  list jobs
+    cq log <id>              show job output
+    cq retry <id>            re-queue a job with its original env/workdir
+    cq cat <id>              print the full command (env, cd, cmd)
+    cq clean                 remove finished and killed jobs
+    cq reset                 wipe all jobs in the namespace
+    cq resume                restart the worker for stuck queues
+
+
+NAMESPACES
+
+    cq -n build make all     # queue in "build" namespace
+    cq -n build list         # list "build" jobs
+    CQ_NS=build cq list      # same thing via env
+
+Each namespace has its own queue. Jobs in different namespaces
+run independently and in parallel.
+
+
+HOW IT WORKS
+
+When you queue a command, cq inserts it into a SQLite database
+and spawns a worker (if one isn't already running). The worker
+picks up jobs one by one, runs each inside a zmx session, and
+waits for it to finish before starting the next.
+
+zmx gives each job a virtual terminal with scrollback. You can
+attach to see live output, detach, and reattach later -- even
+from a different terminal.
+
+State lives in ~/.local/state/cq/ (or $XDG_STATE_HOME/cq/).
+
+
+REQUIREMENTS
+
+    zmx     https://github.com/nicm/zmx
+
+
+INSTALL
+
+    go install github.com/aca/cq@latest

@@ -139,6 +139,10 @@ func main() {
 		cmdRetry(args[1])
 	case "reset":
 		cmdReset()
+	case "clean":
+		cmdClean()
+	case "resume":
+		spawnWorkerDaemon()
 	case "cat":
 		if len(args) < 2 {
 			fmt.Fprintf(os.Stderr, "usage: cq cat <job-id>\n")
@@ -160,7 +164,9 @@ commands:
   list                list jobs
   log <job-id>        show job output
   retry <job-id>      re-queue job with original env/workdir
+  clean               remove done/killed jobs
   reset               clear all jobs in namespace
+  resume              respawn worker to process pending jobs
   cat <job-id>        show job command with workdir and env
 
 flags:
@@ -233,32 +239,20 @@ func cmdQueue(args []string) {
 // spawnWorkerDaemon starts the background worker if not already running.
 // The worker is spawned inside a zmx session so it persists after this process exits.
 func spawnWorkerDaemon() {
-	// Check if worker zmx session exists by looking for its PID in `zmx list`
-	if getSessionPID(workerSession) != 0 {
+	// Check if worker is still running (session exists and task hasn't ended)
+	if s := getSession(workerSession); s != nil && !s.ended {
 		return
 	}
+	// Kill stale session if task ended but session lingers
+	exec.Command("zmx", "kill", workerSession).Run()
 
 	self, _ := os.Executable()
 	cwd, _ := os.Getwd()
 
-	// `zmx attach <session> <cmd>` creates a new zmx session and runs cmd inside it.
-	// If session already exists, it attaches to it (but we checked above).
-	cmd := exec.Command("zmx", "attach", workerSession, self, "-n", namespace, "--worker")
+	// zmx run returns immediately after sending the command, so we just need
+	// to wait for it to complete. No Setsid needed since zmx manages the session.
+	cmd := exec.Command("zmx", "run", workerSession, self, "-n", namespace, "--worker")
 	cmd.Dir = cwd
-
-	// Setsid: create new session, detach from controlling terminal.
-	// This ensures zmx (and the worker) survives after we exit:
-	// - New process group: won't receive signals meant for our terminal's foreground group
-	// - No controlling TTY: won't get SIGHUP when terminal closes
-	// - Independent session: shell job control (Ctrl+Z, bg, fg) won't affect it
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-
-	// Redirect to /dev/null since worker runs detached (output goes to zmx session)
-	devNull, _ := os.Open("/dev/null")
-	defer devNull.Close()
-	cmd.Stdin = devNull
-	cmd.Stdout = devNull
-	cmd.Stderr = devNull
 	cmd.Run()
 }
 
@@ -282,13 +276,12 @@ func cmdAttach(idStr string) {
 	}
 
 	sessionName := jobSession(int64(id))
-	cmd := exec.Command("zmx", "attach", sessionName)
-	// Pass through our terminal's stdin/stdout/stderr directly
-	// This makes the job interactive - keystrokes go to job, output comes back
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	cmd.Run()
+	zmxPath, err := exec.LookPath("zmx")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "zmx not found: %v\n", err)
+		os.Exit(1)
+	}
+	syscall.Exec(zmxPath, []string{"zmx", "attach", sessionName}, os.Environ())
 }
 
 func cmdLog(idStr string) {
@@ -415,6 +408,19 @@ func cmdReset() {
 	fmt.Fprintf(os.Stderr, "reset: cleared all jobs in namespace %q\n", namespace)
 }
 
+func cmdClean() {
+	db := openDB()
+	defer db.Close()
+
+	result, err := db.Exec("DELETE FROM "+tableName()+" WHERE status IN ('done', 'killed')")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to clean: %v\n", err)
+		os.Exit(1)
+	}
+	n, _ := result.RowsAffected()
+	fmt.Fprintf(os.Stderr, "clean: removed %d jobs\n", n)
+}
+
 func cmdCat(idStr string) {
 	id, err := strconv.Atoi(idStr)
 	if err != nil {
@@ -520,9 +526,9 @@ func waitForRunningJobs(db *sql.DB) {
 
 		// Wait for this session to complete
 		for {
-			pid := getSessionPID(sessionName)
-			if pid == 0 {
-				// Session done
+			s := getSession(sessionName)
+			if s == nil || s.ended {
+				exec.Command("zmx", "kill", sessionName).Run()
 				db.Exec("UPDATE "+tableName()+" SET status = 'done', finished_at = ? WHERE id = ?", time.Now(), id)
 				break
 			}
@@ -567,68 +573,66 @@ func runJob(db *sql.DB, job *Job) {
 	sessionName := jobSession(job.ID)
 	fmt.Fprintf(os.Stderr, "running: [%d] %s %v\n", job.ID, job.Command, job.Args)
 
-	// `zmx attach <session> <cmd> <args...>` creates a new session running the command.
-	// zmx provides a PTY even though we're not attached - this is key for interactive apps.
-	// The PTY buffers output (scrollback) and provides terminal emulation (ANSI codes, etc).
-	zmxArgs := []string{"attach", sessionName, job.Command}
+	zmxArgs := []string{"run", sessionName, job.Command}
 	zmxArgs = append(zmxArgs, job.Args...)
 
 	cmd := exec.Command("zmx", zmxArgs...)
-	cmd.Dir = job.Workdir // Run in original directory where job was queued
-	cmd.Env = job.Env     // Use original environment (PATH, EDITOR, etc)
-
-	// Worker runs detached, so redirect to /dev/null.
-	// The job's actual I/O goes through zmx's PTY, not these file descriptors.
-	devNull, _ := os.Open("/dev/null")
-	defer devNull.Close()
-	cmd.Stdin = devNull
-	cmd.Stdout = devNull
-	cmd.Stderr = devNull
-
-	// Setsid: detach from terminal so job survives if worker's zmx session closes.
-	// Also prevents job from inheriting worker's process group signals.
+	cmd.Dir = job.Workdir
+	cmd.Env = job.Env
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-
-	// zmx attach returns immediately after spawning (returns 1 when no terminal attached)
 	cmd.Run()
 
-	// Poll zmx to track job lifecycle - zmx list shows running sessions with PIDs
-	pid := getSessionPID(sessionName)
-	if pid == 0 {
-		// Session already finished (fast command like `echo hello`)
-		db.Exec("UPDATE "+tableName()+" SET status = 'done', finished_at = ? WHERE id = ?", time.Now(), job.ID)
-		return
-	}
-	db.Exec("UPDATE "+tableName()+" SET status = 'running', pid = ? WHERE id = ?", pid, job.ID)
-
-	// Wait for zmx session to end (job finished or killed)
+	// Poll zmx to track job lifecycle
+	var exitCode int
 	for {
-		time.Sleep(500 * time.Millisecond)
-		if getSessionPID(sessionName) == 0 {
+		s := getSession(sessionName)
+		if s == nil {
 			break
 		}
+		if s.pid > 0 {
+			db.Exec("UPDATE "+tableName()+" SET pid = ? WHERE id = ? AND pid IS NULL", s.pid, job.ID)
+		}
+		if s.ended {
+			exitCode = s.exitCode
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
 	}
 
-	db.Exec("UPDATE "+tableName()+" SET status = 'done', finished_at = ? WHERE id = ?", time.Now(), job.ID)
+	// Kill the zmx session (it lingers with a shell after task ends)
+	exec.Command("zmx", "kill", sessionName).Run()
+
+	db.Exec("UPDATE "+tableName()+" SET status = 'done', finished_at = ?, exit_code = ? WHERE id = ?", time.Now(), exitCode, job.ID)
 }
 
-// getSessionPID queries zmx for a session's PID. Returns 0 if session doesn't exist.
-// Used to check if worker/job is running and to track job lifecycle.
-func getSessionPID(sessionName string) int {
+type sessionInfo struct {
+	pid      int
+	ended    bool
+	exitCode int
+}
+
+// getSession queries zmx for a session's state.
+// Returns nil if session doesn't exist.
+func getSession(sessionName string) *sessionInfo {
 	output, err := exec.Command("zmx", "list").Output()
 	if err != nil {
-		return 0
+		return nil
 	}
-	// zmx list output format: session_name=cq-default-1\tpid=12345\tclients=0
 	for _, line := range strings.Split(string(output), "\n") {
-		if strings.Contains(line, "session_name="+sessionName+"\t") {
-			for _, part := range strings.Split(line, "\t") {
-				if strings.HasPrefix(part, "pid=") {
-					pid, _ := strconv.Atoi(strings.TrimPrefix(part, "pid="))
-					return pid
-				}
+		if !strings.Contains(line, "session_name="+sessionName+"\t") {
+			continue
+		}
+		info := &sessionInfo{}
+		for _, part := range strings.Split(line, "\t") {
+			if strings.HasPrefix(part, "pid=") {
+				info.pid, _ = strconv.Atoi(strings.TrimPrefix(part, "pid="))
+			} else if strings.HasPrefix(part, "task_ended_at=") {
+				info.ended = true
+			} else if strings.HasPrefix(part, "task_exit_code=") {
+				info.exitCode, _ = strconv.Atoi(strings.TrimPrefix(part, "task_exit_code="))
 			}
 		}
+		return info
 	}
-	return 0
+	return nil
 }
