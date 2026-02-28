@@ -137,6 +137,14 @@ func main() {
 			os.Exit(1)
 		}
 		cmdRetry(args[1])
+	case "reset":
+		cmdReset()
+	case "cat":
+		if len(args) < 2 {
+			fmt.Fprintf(os.Stderr, "usage: cq cat <job-id>\n")
+			os.Exit(1)
+		}
+		cmdCat(args[1])
 	default:
 		cmdQueue(args)
 	}
@@ -152,6 +160,8 @@ commands:
   list                list jobs
   log <job-id>        show job output
   retry <job-id>      re-queue job with original env/workdir
+  reset               clear all jobs in namespace
+  cat <job-id>        show job command with workdir and env
 
 flags:
   -n, --namespace     job queue namespace (default: "default", or CQ_NS env)
@@ -368,7 +378,7 @@ func cmdList() {
 	}
 	defer rows.Close()
 
-	fmt.Printf("%-4s %-10s %-8s %-30s\n", "ID", "STATUS", "PID", "COMMAND")
+	fmt.Printf("%-4s %-10s %-8s %s\n", "ID", "STATUS", "PID", "COMMAND")
 	for rows.Next() {
 		var id int64
 		var command, argsJSON, status string
@@ -386,14 +396,78 @@ func cmdList() {
 
 		cmdStr := command
 		if len(args) > 0 {
-			cmdStr += " " + fmt.Sprintf("%v", args)
-		}
-		if len(cmdStr) > 30 {
-			cmdStr = cmdStr[:27] + "..."
+			cmdStr += " " + strings.Join(args, " ")
 		}
 
-		fmt.Printf("%-4d %-10s %-8s %-30s\n", id, status, pidStr, cmdStr)
+		fmt.Printf("%-4d %-10s %-8s %s\n", id, status, pidStr, cmdStr)
 	}
+}
+
+func cmdReset() {
+	db := openDB()
+	defer db.Close()
+
+	_, err := db.Exec("DELETE FROM " + tableName())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to reset: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Fprintf(os.Stderr, "reset: cleared all jobs in namespace %q\n", namespace)
+}
+
+func cmdCat(idStr string) {
+	id, err := strconv.Atoi(idStr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invalid job id: %s\n", idStr)
+		os.Exit(1)
+	}
+
+	db := openDB()
+	defer db.Close()
+
+	var command, argsJSON, workdir, envJSON string
+	err = db.QueryRow("SELECT command, args, workdir, env FROM "+tableName()+" WHERE id = ?", id).
+		Scan(&command, &argsJSON, &workdir, &envJSON)
+	if err == sql.ErrNoRows {
+		fmt.Fprintf(os.Stderr, "job not found: %d\n", id)
+		os.Exit(1)
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to get job: %v\n", err)
+		os.Exit(1)
+	}
+
+	var args []string
+	json.Unmarshal([]byte(argsJSON), &args)
+	var env []string
+	json.Unmarshal([]byte(envJSON), &env)
+
+	for _, e := range env {
+		fmt.Printf("export %s\n", shellQuote(e))
+	}
+	fmt.Printf("cd %s\n", shellQuote(workdir))
+	cmdStr := shellQuote(command)
+	for _, a := range args {
+		cmdStr += " " + shellQuote(a)
+	}
+	fmt.Printf("%s\n", cmdStr)
+}
+
+func shellQuote(s string) string {
+	if s == "" {
+		return "''"
+	}
+	safe := true
+	for _, c := range s {
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '/' || c == '.' || c == ',' || c == ':' || c == '=' || c == '+') {
+			safe = false
+			break
+		}
+	}
+	if safe {
+		return s
+	}
+	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
 }
 
 // runWorker is the main loop that processes queued jobs sequentially.
