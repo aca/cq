@@ -11,6 +11,26 @@
 //     1. Detached execution: jobs continue running even without a terminal
 //     2. Later attachment: `cq attach <id>` connects your terminal to a running job
 //     3. Scrollback history: `cq log <id>` retrieves output via `zmx history`
+//
+// Shell quoting through zmx:
+//   `zmx run <session> <argv...>` does not exec argv directly — it joins the
+//   trailing argv with spaces, appends `; echo ZMX_TASK_COMPLETED:$?`, and
+//   feeds the whole thing to a shell. This means argv boundaries are lost and
+//   any shell metacharacters in the command would be re-interpreted.
+//
+//   To keep the user's command intact, we double-quote: build a shellCmd
+//   string, then pass it as `sh -c <shellQuote(shellCmd)>`. After zmx's join
+//   the outer shell sees `sh -c '<shellCmd>' ; echo ZMX_TASK_COMPLETED:$?`,
+//   which hands the original command verbatim to a fresh `sh -c`.
+//
+// Remote execution:
+//   `cq --host <ssh-target> ...` execs ssh and runs cq on the remote host,
+//   forwarding the namespace and remaining args. `attach` allocates a TTY.
+//
+// zmx fallback:
+//   If `zmx` is not on PATH, cq falls back to
+//   `nix --extra-experimental-features 'nix-command flakes' run github:neurosnap/zmx -- <args>`,
+//   so a host with nix but no zmx still works.
 
 package main
 
@@ -306,6 +326,18 @@ func startNextJob() {
 	}
 	shellCmd += "); " + shellQuote(self) + " -n " + shellQuote(namespace) + " --done " + strconv.FormatInt(job.ID, 10) + " $?"
 
+	// Quoting note: `zmx run` joins its trailing argv with spaces and feeds the
+	// result to a shell as a single string (it then appends its own
+	// `; echo ZMX_TASK_COMPLETED:$?` suffix). Because of that join, we cannot
+	// rely on argv boundaries to protect shell metacharacters — anything we
+	// pass would get re-parsed by the outer shell.
+	//
+	// To keep the user command opaque to that re-parse, we wrap it in
+	// `sh -c '<cmd>'`, where `<cmd>` is the full shellCmd built above and the
+	// outer single-quoting is added by shellQuote. After zmx joins, the shell
+	// sees: `sh -c '<cmd>' ; echo ZMX_TASK_COMPLETED:$?` — valid syntax that
+	// hands the original command (parens, $?, semicolons and all) to a fresh
+	// `sh -c` unmodified.
 	cmd := zmxExec("run", sessionName, "sh", "-c", shellQuote(shellCmd))
 	cmd.Dir = job.Workdir
 	cmd.Env = job.Env
