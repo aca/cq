@@ -15,13 +15,16 @@
 // Shell quoting through zmx:
 //   `zmx run <session> <argv...>` does not exec argv directly — it joins the
 //   trailing argv with spaces, appends `; echo ZMX_TASK_COMPLETED:$?`, and
-//   feeds the whole thing to a shell. This means argv boundaries are lost and
-//   any shell metacharacters in the command would be re-interpreted.
+//   feeds the whole thing to a shell. Worse, different zmx builds disagree on
+//   whether to %q-quote each argv element before joining (the nix flake build
+//   does; some local builds do not). Either way, any shell metacharacter we
+//   try to pass through argv ends up mangled by one side or the other.
 //
-//   To keep the user's command intact, we double-quote: build a shellCmd
-//   string, then pass it as `sh -c <shellQuote(shellCmd)>`. After zmx's join
-//   the outer shell sees `sh -c '<shellCmd>' ; echo ZMX_TASK_COMPLETED:$?`,
-//   which hands the original command verbatim to a fresh `sh -c`.
+//   To dodge the entire problem, we write the wrapped command to a script
+//   file in the state dir and invoke it as `sh <path>`. Both `sh` and the
+//   path contain only quote-safe characters (alnum, `/`, `-`, `.`, `_`),
+//   so they survive any join/quote variation untouched. cmdDone removes the
+//   script after recording the result.
 //
 // Remote execution:
 //   `cq --host <ssh-target> ...` execs ssh and runs cq on the remote host,
@@ -226,6 +229,10 @@ func jobSession(id int64) string {
 	return fmt.Sprintf("cq-%s-%d", namespace, id)
 }
 
+func jobScriptPath(id int64) string {
+	return filepath.Join(getStateDir(), fmt.Sprintf("%s-%d.sh", namespace, id))
+}
+
 func openDB() *sql.DB {
 	db, err := sql.Open("sqlite3", dbFile)
 	if err != nil {
@@ -326,19 +333,13 @@ func startNextJob() {
 	}
 	shellCmd += "); " + shellQuote(self) + " -n " + shellQuote(namespace) + " --done " + strconv.FormatInt(job.ID, 10) + " $?"
 
-	// Quoting note: `zmx run` joins its trailing argv with spaces and feeds the
-	// result to a shell as a single string (it then appends its own
-	// `; echo ZMX_TASK_COMPLETED:$?` suffix). Because of that join, we cannot
-	// rely on argv boundaries to protect shell metacharacters — anything we
-	// pass would get re-parsed by the outer shell.
-	//
-	// To keep the user command opaque to that re-parse, we wrap it in
-	// `sh -c '<cmd>'`, where `<cmd>` is the full shellCmd built above and the
-	// outer single-quoting is added by shellQuote. After zmx joins, the shell
-	// sees: `sh -c '<cmd>' ; echo ZMX_TASK_COMPLETED:$?` — valid syntax that
-	// hands the original command (parens, $?, semicolons and all) to a fresh
-	// `sh -c` unmodified.
-	cmd := zmxExec("run", sessionName, "sh", "-c", shellQuote(shellCmd))
+	// Write the wrapped command to a script file rather than passing it
+	// through zmx's argv. See the "Shell quoting through zmx" note at the
+	// top of the file for why argv-based passing is unreliable.
+	scriptPath := jobScriptPath(job.ID)
+	os.WriteFile(scriptPath, []byte(shellCmd+"\n"), 0644)
+
+	cmd := zmxExec("run", sessionName, "sh", scriptPath)
 	cmd.Dir = job.Workdir
 	cmd.Env = job.Env
 	cmd.Run()
@@ -370,6 +371,8 @@ func cmdDone(args []string) {
 
 	db.Exec("UPDATE "+tableName()+" SET status = 'done', finished_at = ?, exit_code = ? WHERE id = ?",
 		time.Now(), exitCode, id)
+
+	os.Remove(jobScriptPath(int64(id)))
 
 	notifyDone(int64(id), exitCode)
 
