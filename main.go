@@ -32,6 +32,7 @@ import (
 )
 
 var namespace string
+var host string
 var dbFile string
 var lockFile string
 
@@ -41,6 +42,7 @@ func init() {
 		defaultNS = "default"
 	}
 	flag.StringVarP(&namespace, "namespace", "n", defaultNS, "job queue namespace")
+	flag.StringVar(&host, "host", "", "run cq on remote host via ssh")
 }
 
 func getStateDir() string {
@@ -95,6 +97,11 @@ func main() {
 	args := flag.Args()
 	if len(args) < 1 {
 		usage()
+	}
+
+	if host != "" {
+		runRemote(host, args)
+		return
 	}
 
 	// `cq -- <cmd>` forces queuing, bypassing subcommand matching
@@ -171,6 +178,7 @@ commands:
 
 flags:
   -n, --namespace     job queue namespace (default: "default", or CQ_NS env)
+      --host          run cq on remote host via ssh
 `)
 	os.Exit(1)
 }
@@ -185,7 +193,7 @@ func zmxArgs(args ...string) (string, []string) {
 	if _, err := exec.LookPath("zmx"); err == nil {
 		return "zmx", args
 	}
-	nixArgs := []string{"run", "github:neurosnap/zmx", "--"}
+	nixArgs := []string{"--extra-experimental-features", "nix-command flakes", "run", "github:neurosnap/zmx", "--"}
 	return "nix", append(nixArgs, args...)
 }
 
@@ -335,6 +343,32 @@ func cmdDone(args []string) {
 
 	// Start the next pending job
 	startNextJob()
+}
+
+// runRemote execs ssh to run cq on a remote host, forwarding namespace
+// and the remaining args.
+func runRemote(host string, args []string) {
+	sshBin, err := exec.LookPath("ssh")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ssh not found: %v\n", err)
+		os.Exit(1)
+	}
+
+	remote := "cq"
+	if namespace != "" && namespace != "default" {
+		remote += " -n " + shellQuote(namespace)
+	}
+	for _, a := range args {
+		remote += " " + shellQuote(a)
+	}
+
+	sshArgs := []string{"ssh"}
+	// allocate a tty for interactive subcommand
+	if args[0] == "attach" || args[0] == "a" {
+		sshArgs = append(sshArgs, "-t")
+	}
+	sshArgs = append(sshArgs, host, remote)
+	syscall.Exec(sshBin, sshArgs, os.Environ())
 }
 
 func notifyDone(id int64, exitCode int) {
