@@ -580,7 +580,7 @@ func cmdList() {
 
 		statusStr := status
 		if status == "done" && exitCode.Valid && exitCode.Int64 != 0 {
-			statusStr = "fail"
+			statusStr = fmt.Sprintf("fail(%d)", exitCode.Int64)
 		} else if status == "killed" && exitCode.Valid {
 			statusStr = fmt.Sprintf("killed(%d)", exitCode.Int64)
 		}
