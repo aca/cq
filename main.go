@@ -579,8 +579,10 @@ func cmdList() {
 		}
 
 		statusStr := status
-		if (status == "done" || status == "killed") && exitCode.Valid {
-			statusStr = fmt.Sprintf("%s(%d)", status, exitCode.Int64)
+		if status == "done" && exitCode.Valid && exitCode.Int64 != 0 {
+			statusStr = "fail"
+		} else if status == "killed" && exitCode.Valid {
+			statusStr = fmt.Sprintf("killed(%d)", exitCode.Int64)
 		}
 
 		cmdStr := command
