@@ -306,7 +306,7 @@ func startNextJob() {
 	}
 	shellCmd += "); " + shellQuote(self) + " -n " + shellQuote(namespace) + " --done " + strconv.FormatInt(job.ID, 10) + " $?"
 
-	cmd := zmxExec( "run", sessionName, shellCmd)
+	cmd := zmxExec("run", sessionName, "sh", "-c", shellQuote(shellCmd))
 	cmd.Dir = job.Workdir
 	cmd.Env = job.Env
 	cmd.Run()
