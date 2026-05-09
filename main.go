@@ -138,7 +138,7 @@ func main() {
 			os.Exit(1)
 		}
 		cmdRm(args[1])
-	case "clean":
+	case "clean", "clear":
 		cmdClean()
 	case "resume":
 		startNextJob()
