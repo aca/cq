@@ -1,0 +1,13 @@
+
+● shellQuote가 필요한 이유는 우리가 argv를 exec하는 게 아니라 shell 스크립트 문자열을 조립하고 있기 때문이야. 두 군데에서 쓰여:
+
+  1. 스크립트 파일 내용 만들 때 (startNextJob):
+  (cmd arg1 arg2); /home/rok/bin/cq -n default --done 5 $?
+  1. 이건 sh에 의해 파싱돼. 만약 사용자가 cq -- echo "hello world" 했다면 quote 없이 그냥 이어붙이면 echo hello world가 돼서 인자가 둘로 쪼개져. ;,
+   $, *, 공백 같은 메타가 들어 있으면 더 심각하게 깨지고. shellQuote로 감싸면 echo 'hello world'가 되어서 sh가 원래 1개 인자로 복원함.
+  2. runRemote의 ssh 명령 만들 때: 마찬가지로 ssh host "cq -n ns arg1 arg2" 형태로 한 string을 원격 shell에 넘기니까 각 인자를 quote해야 원격
+  shell이 잘못 쪼개지 않음.
+
+  반대로 cmd := exec.Command("sh", scriptPath)처럼 argv로 직접 exec할 때는 OS execve가 argv 경계를 그대로 보존하니까 quote 불필요. 그래서 zmx
+  우회로 스크립트 파일 + sh <path> 방식으로 바꾼 뒤로는, zmx에 넘기는 argv 자체에는 quote가 필요 없게 됐고 (path 두 개만 넘김), shellQuote는 오직
+  "스크립트 내용을 안전하게 조립"하는 데만 남아 있어.

@@ -52,6 +52,7 @@ import (
 
 	_ "github.com/mattn/go-sqlite3"
 	flag "github.com/spf13/pflag"
+	"mvdan.cc/sh/v3/syntax"
 )
 
 var namespace string
@@ -290,35 +291,19 @@ func cmdQueue(args []string) {
 }
 
 // startNextJob starts the next pending job if nothing is currently running.
+//
+// Locking discipline: the flock is held only long enough to atomically
+// claim the next pending job (mark it running). The actual zmx spawn and
+// PID polling happen with the lock released, so the in-session
+// `cq --done` callback can re-enter startNextJob to chain the next job.
 func startNextJob() {
 	db := openDB()
 	defer db.Close()
 
-	// Use flock to prevent races between concurrent cq calls
-	lock, err := os.OpenFile(lockFile, os.O_CREATE|os.O_RDWR, 0644)
-	if err != nil {
+	job := claimNextJob(db)
+	if job == nil {
 		return
 	}
-	defer lock.Close()
-	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		// Another process holds the lock, it will handle chaining
-		return
-	}
-	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
-
-	// Don't start if something is already running
-	var count int
-	db.QueryRow("SELECT COUNT(*) FROM " + tableName() + " WHERE status = 'running'").Scan(&count)
-	if count > 0 {
-		return
-	}
-
-	job, err := getNextJob(db)
-	if err != nil || job == nil {
-		return
-	}
-
-	db.Exec("UPDATE "+tableName()+" SET status = 'running', started_at = ? WHERE id = ?", time.Now(), job.ID)
 
 	sessionName := jobSession(job.ID)
 
@@ -327,11 +312,18 @@ func startNextJob() {
 	// The subshell (...) prevents builtins like `exit` from killing zmx's shell.
 	// After the command finishes, --done saves the result and starts the next job.
 	self, _ := os.Executable()
-	shellCmd := "(" + shellQuote(job.Command)
+	userCmd := shellQuote(job.Command)
 	for _, a := range job.Args {
-		shellCmd += " " + shellQuote(a)
+		userCmd += " " + shellQuote(a)
 	}
-	shellCmd += "); " + shellQuote(self) + " -n " + shellQuote(namespace) + " --done " + strconv.FormatInt(job.ID, 10) + " $?"
+	// Echo the command first so `cq attach` shows what's running.
+	display := job.Command
+	if len(job.Args) > 0 {
+		display += " " + strings.Join(job.Args, " ")
+	}
+	shellCmd := "echo " + shellQuote("$ "+display) + "; "
+	shellCmd += "(" + userCmd + "); "
+	shellCmd += shellQuote(self) + " -n " + shellQuote(namespace) + " --done " + strconv.FormatInt(job.ID, 10) + " $?"
 
 	// Write the wrapped command to a script file rather than passing it
 	// through zmx's argv. See the "Shell quoting through zmx" note at the
@@ -339,15 +331,68 @@ func startNextJob() {
 	scriptPath := jobScriptPath(job.ID)
 	os.WriteFile(scriptPath, []byte(shellCmd+"\n"), 0644)
 
+	fmt.Fprintf(os.Stderr, "starting [%d] %s\n  script: %s\n  %s\n", job.ID, sessionName, scriptPath, shellCmd)
+
+	// Spawn zmx in the background. zmx run can attach to the calling
+	// terminal and block until the session exits, so we must Start() (not
+	// Run()) and detach. The session itself persists after cq exits because
+	// zmx is a multiplexer.
 	cmd := zmxExec("run", sessionName, "sh", scriptPath)
 	cmd.Dir = job.Workdir
 	cmd.Env = job.Env
-	cmd.Run()
-
-	// Record PID
-	if s := getSession(sessionName); s != nil && s.pid > 0 {
-		db.Exec("UPDATE "+tableName()+" SET pid = ? WHERE id = ?", s.pid, job.ID)
+	devNull, _ := os.OpenFile(os.DevNull, os.O_RDWR, 0)
+	if devNull != nil {
+		cmd.Stdin = devNull
+		cmd.Stdout = devNull
+		cmd.Stderr = devNull
+		defer devNull.Close()
 	}
+	// Detach from the calling terminal: new session + new process group so
+	// zmx cannot grab the controlling tty and block our return.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := cmd.Start(); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to start zmx: %v\n", err)
+		return
+	}
+	cmd.Process.Release()
+
+	// Poll briefly for the session to register and record its PID.
+	for i := 0; i < 40; i++ {
+		if s := getSession(sessionName); s != nil && s.pid > 0 {
+			db.Exec("UPDATE "+tableName()+" SET pid = ? WHERE id = ?", s.pid, job.ID)
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// claimNextJob atomically picks the next pending job and marks it running.
+// Returns nil if a job is already running, no pending jobs exist, or the
+// lock cannot be acquired (another cq process is doing the same work).
+func claimNextJob(db *sql.DB) *Job {
+	lock, err := os.OpenFile(lockFile, os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		return nil
+	}
+	defer lock.Close()
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		return nil
+	}
+	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+
+	var count int
+	db.QueryRow("SELECT COUNT(*) FROM " + tableName() + " WHERE status = 'running'").Scan(&count)
+	if count > 0 {
+		return nil
+	}
+
+	job, err := getNextJob(db)
+	if err != nil || job == nil {
+		return nil
+	}
+
+	db.Exec("UPDATE "+tableName()+" SET status = 'running', started_at = ? WHERE id = ?", time.Now(), job.ID)
+	return job
 }
 
 // cmdDone is called by the wrapper after a job finishes.
@@ -700,20 +745,13 @@ func shortenPath(p string) string {
 }
 
 func shellQuote(s string) string {
-	if s == "" {
-		return "''"
-	}
-	safe := true
-	for _, c := range s {
-		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '/' || c == '.' || c == ',' || c == ':' || c == '=' || c == '+') {
-			safe = false
-			break
-		}
-	}
-	if safe {
+	q, err := syntax.Quote(s, syntax.LangPOSIX)
+	if err != nil {
+		// syntax.Quote only fails for strings containing characters that
+		// cannot be expressed in POSIX (e.g. NUL). Fall back to a literal.
 		return s
 	}
-	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
+	return q
 }
 
 type Job struct {
