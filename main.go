@@ -3,28 +3,27 @@
 // A job queue that runs commands sequentially using zmx (terminal multiplexer).
 //
 // Architecture:
-//   - Jobs are stored in SQLite with command, args, workdir, and full environment
-//   - Each job runs inside a zmx session with a wrapper that chains to the next job
-//   - No daemon or polling: when a job finishes, the wrapper calls `cq --done`
-//     which saves the result and starts the next pending job
-//   - Each job runs inside a zmx session, enabling:
+//   - Jobs are stored in SQLite (single `jobs` table, namespaced via the `ns`
+//     column).
+//   - A single worker process per namespace pulls pending jobs and runs each
+//     in its own zmx session. The worker is spawned on demand by `cq <cmd>`
+//     (detached via Setsid) and exits after a short idle timeout. Mutual
+//     exclusion is enforced with an flock on the namespace lock file.
+//   - The worker polls `zmx list` to detect session completion; no in-session
+//     callback is required.
+//   - Each job runs inside its own zmx session, enabling:
 //     1. Detached execution: jobs continue running even without a terminal
-//     2. Later attachment: `cq attach <id>` connects your terminal to a running job
+//     2. Later attachment: `cq attach <id>` connects your terminal to the job
 //     3. Scrollback history: `cq log <id>` retrieves output via `zmx history`
 //
 // Shell quoting through zmx:
 //   `zmx run <session> <argv...>` does not exec argv directly — it joins the
-//   trailing argv with spaces, appends `; echo ZMX_TASK_COMPLETED:$?`, and
-//   feeds the whole thing to a shell. Worse, different zmx builds disagree on
-//   whether to %q-quote each argv element before joining (the nix flake build
-//   does; some local builds do not). Either way, any shell metacharacter we
-//   try to pass through argv ends up mangled by one side or the other.
-//
-//   To dodge the entire problem, we write the wrapped command to a script
-//   file in the state dir and invoke it as `sh <path>`. Both `sh` and the
-//   path contain only quote-safe characters (alnum, `/`, `-`, `.`, `_`),
-//   so they survive any join/quote variation untouched. cmdDone removes the
-//   script after recording the result.
+//   trailing argv with spaces and feeds the whole thing to a shell. Different
+//   zmx builds disagree on whether to %q-quote each argv element first (the
+//   nix flake build does; some local builds do not). To dodge that, we write
+//   the wrapped command to a script file in the state dir and invoke it as
+//   `sh <path>` — both tokens are quote-safe so they survive any join/quote
+//   variation untouched. The worker removes the script when the job is done.
 //
 // Remote execution:
 //   `cq --host <ssh-target> ...` execs ssh and runs cq on the remote host,
@@ -57,6 +56,7 @@ import (
 
 var namespace string
 var host string
+var workerMode bool
 var dbFile string
 var lockFile string
 
@@ -67,6 +67,7 @@ func init() {
 	}
 	flag.StringVarP(&namespace, "namespace", "n", defaultNS, "job queue namespace")
 	flag.StringVar(&host, "host", "", "run cq on remote host via ssh")
+	flag.BoolVar(&workerMode, "worker", false, "internal: run worker loop")
 }
 
 func getStateDir() string {
@@ -92,29 +93,12 @@ func initNamespace() {
 }
 
 func main() {
-	// Check for internal --done <id> <exit_code> before flag parsing.
-	// Save the done args, then strip them so pflag doesn't see them.
-	var doneArgs []string
-	var filteredArgs []string
-	for i, arg := range os.Args {
-		if arg == "--done" && i+2 < len(os.Args) {
-			doneArgs = os.Args[i+1 : i+3]
-			filteredArgs = append(filteredArgs, os.Args[:i]...)
-			// skip --done <id> <exit_code>
-			break
-		}
-	}
-	if doneArgs == nil {
-		filteredArgs = os.Args
-	}
-
-	os.Args = filteredArgs
 	flag.CommandLine.SetInterspersed(false)
 	flag.Parse()
 	initNamespace()
 
-	if doneArgs != nil {
-		cmdDone(doneArgs)
+	if workerMode {
+		cmdWorker()
 		return
 	}
 
@@ -172,7 +156,7 @@ func main() {
 	case "clean", "clear":
 		cmdClean()
 	case "resume":
-		startNextJob()
+		spawnWorker()
 	case "cat":
 		if len(args) < 2 {
 			fmt.Fprintf(os.Stderr, "usage: cq cat <job-id>\n")
@@ -207,10 +191,6 @@ flags:
 	os.Exit(1)
 }
 
-func tableName() string {
-	return fmt.Sprintf("jobs_%s", namespace)
-}
-
 // zmxArgs returns the command and args to invoke zmx.
 // Falls back to `nix run github:neurosnap/zmx --` if zmx is not in PATH.
 func zmxArgs(args ...string) (string, []string) {
@@ -241,9 +221,10 @@ func openDB() *sql.DB {
 		os.Exit(1)
 	}
 
-	_, err = db.Exec(fmt.Sprintf(`
-		CREATE TABLE IF NOT EXISTS %s (
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS jobs (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			ns TEXT NOT NULL,
 			command TEXT NOT NULL,
 			args TEXT NOT NULL,
 			workdir TEXT NOT NULL,
@@ -256,16 +237,40 @@ func openDB() *sql.DB {
 			exit_code INTEGER,
 			log TEXT
 		)
-	`, tableName()))
+	`)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to create table: %v\n", err)
 		os.Exit(1)
 	}
 
-	// migrate: add log column if missing
-	db.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN log TEXT", tableName()))
+	migrateOldTables(db)
 
 	return db
+}
+
+// migrateOldTables copies rows from per-namespace `jobs_<ns>` tables (the
+// pre-refactor schema) into the unified `jobs` table, then drops them.
+func migrateOldTables(db *sql.DB) {
+	rows, err := db.Query("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'jobs\\_%' ESCAPE '\\'")
+	if err != nil {
+		return
+	}
+	var oldTables []string
+	for rows.Next() {
+		var name string
+		rows.Scan(&name)
+		oldTables = append(oldTables, name)
+	}
+	rows.Close()
+
+	for _, t := range oldTables {
+		ns := strings.TrimPrefix(t, "jobs_")
+		// ns came from the user's CQ_NS / -n flag and was previously a SQL
+		// identifier suffix, so it's already constrained to safe chars.
+		db.Exec(fmt.Sprintf(`INSERT INTO jobs (ns, command, args, workdir, env, status, pid, created_at, started_at, finished_at, exit_code, log)
+			SELECT '%s', command, args, workdir, env, status, pid, created_at, started_at, finished_at, exit_code, log FROM %s`, ns, t))
+		db.Exec(fmt.Sprintf("DROP TABLE %s", t))
+	}
 }
 
 func cmdQueue(args []string) {
@@ -277,8 +282,8 @@ func cmdQueue(args []string) {
 	workdir, _ := os.Getwd()
 	envJSON, _ := json.Marshal(os.Environ())
 
-	result, err := db.Exec("INSERT INTO "+tableName()+" (command, args, workdir, env, status, created_at) VALUES (?, ?, ?, ?, 'pending', ?)",
-		cmdName, string(cmdArgsJSON), workdir, string(envJSON), time.Now())
+	result, err := db.Exec("INSERT INTO jobs (ns, command, args, workdir, env, status, created_at) VALUES (?, ?, ?, ?, ?, 'pending', ?)",
+		namespace, cmdName, string(cmdArgsJSON), workdir, string(envJSON), time.Now())
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to queue job: %v\n", err)
 		os.Exit(1)
@@ -287,56 +292,88 @@ func cmdQueue(args []string) {
 	jobID, _ := result.LastInsertId()
 	fmt.Fprintf(os.Stderr, "queued: [%d] %s\n", jobID, args)
 
-	startNextJob()
+	spawnWorker()
 }
 
-// startNextJob starts the next pending job if nothing is currently running.
-//
-// Locking discipline: the flock is held only long enough to atomically
-// claim the next pending job (mark it running). The actual zmx spawn and
-// PID polling happen with the lock released, so the in-session
-// `cq --done` callback can re-enter startNextJob to chain the next job.
-func startNextJob() {
+// spawnWorker launches a detached `cq --worker` process. If a worker is
+// already running for this namespace it will fail to acquire the flock and
+// exit silently, so calling this is always safe.
+func spawnWorker() {
+	self, err := os.Executable()
+	if err != nil {
+		return
+	}
+	cmd := exec.Command(self, "-n", namespace, "--worker")
+	devNull, _ := os.OpenFile(os.DevNull, os.O_RDWR, 0)
+	if devNull != nil {
+		cmd.Stdin = devNull
+		cmd.Stdout = devNull
+		cmd.Stderr = devNull
+		defer devNull.Close()
+	}
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := cmd.Start(); err != nil {
+		return
+	}
+	cmd.Process.Release()
+}
+
+// cmdWorker is the long-running worker loop. Only one worker per namespace
+// can run at a time, enforced by an flock on the namespace's lock file.
+// Polls SQLite for pending jobs, runs each in its own zmx session, and
+// polls `zmx list` to detect completion. Exits after a short idle window
+// so a stale queue doesn't leak processes.
+func cmdWorker() {
+	lock, err := os.OpenFile(lockFile, os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		return
+	}
+	defer lock.Close()
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		return // another worker holds the lock
+	}
+	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+
 	db := openDB()
 	defer db.Close()
 
-	job := claimNextJob(db)
-	if job == nil {
-		return
+	const idleExitRounds = 30 // exit after ~30s with no pending work
+	idle := 0
+	for idle < idleExitRounds {
+		job, _ := getNextJob(db)
+		if job == nil {
+			time.Sleep(time.Second)
+			idle++
+			continue
+		}
+		idle = 0
+		runJob(db, job)
 	}
+}
+
+// runJob executes a single job: marks it running, spawns its zmx session,
+// polls until completion, then records the result and saves scrollback.
+func runJob(db *sql.DB, job *Job) {
+	db.Exec("UPDATE jobs SET status = 'running', started_at = ? WHERE id = ?", time.Now(), job.ID)
 
 	sessionName := jobSession(job.ID)
 
-	// Build the wrapped command:
-	//   (user_command); cq -n <ns> --done <id> $?
-	// The subshell (...) prevents builtins like `exit` from killing zmx's shell.
-	// After the command finishes, --done saves the result and starts the next job.
-	self, _ := os.Executable()
 	userCmd := shellQuote(job.Command)
 	for _, a := range job.Args {
 		userCmd += " " + shellQuote(a)
 	}
-	// Echo the command first so `cq attach` shows what's running.
 	display := job.Command
 	if len(job.Args) > 0 {
 		display += " " + strings.Join(job.Args, " ")
 	}
-	shellCmd := "echo " + shellQuote("$ "+display) + "; "
-	shellCmd += "(" + userCmd + "); "
-	shellCmd += shellQuote(self) + " -n " + shellQuote(namespace) + " --done " + strconv.FormatInt(job.ID, 10) + " $?"
+	// Echo the command first so `cq attach` / `cq log` shows what's running.
+	// The subshell wraps the user command so a builtin `exit` doesn't kill
+	// zmx's shell before we can capture the exit code.
+	shellCmd := "echo " + shellQuote("$ "+display) + "\n(" + userCmd + ")\n"
 
-	// Write the wrapped command to a script file rather than passing it
-	// through zmx's argv. See the "Shell quoting through zmx" note at the
-	// top of the file for why argv-based passing is unreliable.
 	scriptPath := jobScriptPath(job.ID)
-	os.WriteFile(scriptPath, []byte(shellCmd+"\n"), 0644)
+	os.WriteFile(scriptPath, []byte(shellCmd), 0644)
 
-	fmt.Fprintf(os.Stderr, "starting [%d] %s\n  script: %s\n  %s\n", job.ID, sessionName, scriptPath, shellCmd)
-
-	// Spawn zmx in the background. zmx run can attach to the calling
-	// terminal and block until the session exits, so we must Start() (not
-	// Run()) and detach. The session itself persists after cq exits because
-	// zmx is a multiplexer.
 	cmd := zmxExec("run", sessionName, "sh", scriptPath)
 	cmd.Dir = job.Workdir
 	cmd.Env = job.Env
@@ -347,82 +384,56 @@ func startNextJob() {
 		cmd.Stderr = devNull
 		defer devNull.Close()
 	}
-	// Detach from the calling terminal: new session + new process group so
-	// zmx cannot grab the controlling tty and block our return.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := cmd.Start(); err != nil {
-		fmt.Fprintf(os.Stderr, "failed to start zmx: %v\n", err)
+		db.Exec("UPDATE jobs SET status = 'done', exit_code = -1, finished_at = ? WHERE id = ?", time.Now(), job.ID)
+		os.Remove(scriptPath)
 		return
 	}
 	cmd.Process.Release()
 
-	// Poll briefly for the session to register and record its PID.
+	// Wait for the session to register and capture its pid.
 	for i := 0; i < 40; i++ {
 		if s := getSession(sessionName); s != nil && s.pid > 0 {
-			db.Exec("UPDATE "+tableName()+" SET pid = ? WHERE id = ?", s.pid, job.ID)
-			return
+			db.Exec("UPDATE jobs SET pid = ? WHERE id = ?", s.pid, job.ID)
+			break
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-}
 
-// claimNextJob atomically picks the next pending job and marks it running.
-// Returns nil if a job is already running, no pending jobs exist, or the
-// lock cannot be acquired (another cq process is doing the same work).
-func claimNextJob(db *sql.DB) *Job {
-	lock, err := os.OpenFile(lockFile, os.O_CREATE|os.O_RDWR, 0644)
-	if err != nil {
-		return nil
-	}
-	defer lock.Close()
-	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		return nil
-	}
-	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
-
-	var count int
-	db.QueryRow("SELECT COUNT(*) FROM " + tableName() + " WHERE status = 'running'").Scan(&count)
-	if count > 0 {
-		return nil
+	// Poll until zmx reports the task as ended (or the session vanishes).
+	exitCode := -1
+	for {
+		s := getSession(sessionName)
+		if s == nil {
+			break
+		}
+		if s.ended {
+			exitCode = s.exitCode
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
 	}
 
-	job, err := getNextJob(db)
-	if err != nil || job == nil {
-		return nil
+	// Save scrollback while the session still exists.
+	if logOutput, err := zmxExec("history", sessionName).Output(); err == nil {
+		db.Exec("UPDATE jobs SET log = ? WHERE id = ?", string(logOutput), job.ID)
 	}
 
-	db.Exec("UPDATE "+tableName()+" SET status = 'running', started_at = ? WHERE id = ?", time.Now(), job.ID)
-	return job
-}
-
-// cmdDone is called by the wrapper after a job finishes.
-// It saves the result and starts the next pending job.
-func cmdDone(args []string) {
-	if len(args) < 2 {
-		return
-	}
-	id, _ := strconv.Atoi(args[0])
-	exitCode, _ := strconv.Atoi(args[1])
-
-	db := openDB()
-	defer db.Close()
-
-	sessionName := jobSession(int64(id))
-
-	// Save scrollback history before killing the session
-	if logOutput, err := zmxExec( "history", sessionName).Output(); err == nil {
-		db.Exec("UPDATE "+tableName()+" SET log = ? WHERE id = ?", string(logOutput), id)
+	// If the user already marked the job killed, preserve that status.
+	var status string
+	db.QueryRow("SELECT status FROM jobs WHERE id = ?", job.ID).Scan(&status)
+	if status != "killed" {
+		db.Exec("UPDATE jobs SET status = 'done', finished_at = ?, exit_code = ? WHERE id = ?",
+			time.Now(), exitCode, job.ID)
+	} else {
+		db.Exec("UPDATE jobs SET finished_at = ?, exit_code = ? WHERE id = ?",
+			time.Now(), exitCode, job.ID)
 	}
 
-	db.Exec("UPDATE "+tableName()+" SET status = 'done', finished_at = ?, exit_code = ? WHERE id = ?",
-		time.Now(), exitCode, id)
-
-	os.Remove(jobScriptPath(int64(id)))
-
-	notifyDone(int64(id), exitCode)
-
-	// Start the next pending job
-	startNextJob()
+	os.Remove(scriptPath)
+	zmxExec("kill", sessionName).Run() // best-effort cleanup; harmless if already gone
+	notifyDone(job.ID, exitCode)
 }
 
 // runRemote execs ssh to run cq on a remote host, forwarding namespace
@@ -463,7 +474,7 @@ func notifyDone(id int64, exitCode int) {
 	defer db.Close()
 
 	var command, argsJSON string
-	if err := db.QueryRow("SELECT command, args FROM "+tableName()+" WHERE id = ?", id).Scan(&command, &argsJSON); err != nil {
+	if err := db.QueryRow("SELECT command, args FROM jobs WHERE id = ? AND ns = ?", id, namespace).Scan(&command, &argsJSON); err != nil {
 		return
 	}
 	var args []string
@@ -522,7 +533,7 @@ func cmdLog(idStr string) {
 	defer db.Close()
 
 	var log sql.NullString
-	err = db.QueryRow("SELECT log FROM "+tableName()+" WHERE id = ?", id).Scan(&log)
+	err = db.QueryRow("SELECT log FROM jobs WHERE id = ? AND ns = ?", id, namespace).Scan(&log)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "job not found: %d\n", id)
 		os.Exit(1)
@@ -551,10 +562,10 @@ func cmdKill(idStr string) {
 
 	db := openDB()
 	defer db.Close()
-	db.Exec("UPDATE "+tableName()+" SET status = 'killed' WHERE id = ?", id)
+	db.Exec("UPDATE jobs SET status = 'killed' WHERE id = ? AND ns = ?", id, namespace)
 
-	// Start next pending job since the running one was killed
-	startNextJob()
+	// Wake the worker so it can pick up the next pending job.
+	spawnWorker()
 }
 
 func cmdRetry(idStr string) {
@@ -568,7 +579,7 @@ func cmdRetry(idStr string) {
 	defer db.Close()
 
 	var command, argsJSON, workdir, envJSON string
-	err = db.QueryRow("SELECT command, args, workdir, env FROM "+tableName()+" WHERE id = ?", id).
+	err = db.QueryRow("SELECT command, args, workdir, env FROM jobs WHERE id = ? AND ns = ?", id, namespace).
 		Scan(&command, &argsJSON, &workdir, &envJSON)
 	if err == sql.ErrNoRows {
 		fmt.Fprintf(os.Stderr, "job not found: %d\n", id)
@@ -579,8 +590,8 @@ func cmdRetry(idStr string) {
 		os.Exit(1)
 	}
 
-	result, err := db.Exec("INSERT INTO "+tableName()+" (command, args, workdir, env, status, created_at) VALUES (?, ?, ?, ?, 'pending', ?)",
-		command, argsJSON, workdir, envJSON, time.Now())
+	result, err := db.Exec("INSERT INTO jobs (ns, command, args, workdir, env, status, created_at) VALUES (?, ?, ?, ?, ?, 'pending', ?)",
+		namespace, command, argsJSON, workdir, envJSON, time.Now())
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to queue job: %v\n", err)
 		os.Exit(1)
@@ -591,7 +602,7 @@ func cmdRetry(idStr string) {
 	json.Unmarshal([]byte(argsJSON), &args)
 	fmt.Fprintf(os.Stderr, "queued: [%d] %s %v\n", jobID, command, args)
 
-	startNextJob()
+	spawnWorker()
 }
 
 func cmdList() {
@@ -599,7 +610,8 @@ func cmdList() {
 	defer db.Close()
 
 	rows, err := db.Query(
-		"SELECT id, command, args, workdir, status, pid, exit_code FROM " + tableName() + " ORDER BY id DESC LIMIT 20",
+		"SELECT id, command, args, workdir, status, pid, exit_code FROM jobs WHERE ns = ? ORDER BY id DESC LIMIT 20",
+		namespace,
 	)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to query jobs: %v\n", err)
@@ -643,7 +655,7 @@ func cmdReset() {
 	db := openDB()
 	defer db.Close()
 
-	_, err := db.Exec("DELETE FROM " + tableName())
+	_, err := db.Exec("DELETE FROM jobs WHERE ns = ?", namespace)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to reset: %v\n", err)
 		os.Exit(1)
@@ -662,7 +674,7 @@ func cmdRm(idStr string) {
 	defer db.Close()
 
 	var status string
-	err = db.QueryRow("SELECT status FROM "+tableName()+" WHERE id = ?", id).Scan(&status)
+	err = db.QueryRow("SELECT status FROM jobs WHERE id = ? AND ns = ?", id, namespace).Scan(&status)
 	if err == sql.ErrNoRows {
 		fmt.Fprintf(os.Stderr, "job not found: %d\n", id)
 		os.Exit(1)
@@ -672,7 +684,7 @@ func cmdRm(idStr string) {
 		os.Exit(1)
 	}
 
-	db.Exec("DELETE FROM "+tableName()+" WHERE id = ?", id)
+	db.Exec("DELETE FROM jobs WHERE id = ? AND ns = ?", id, namespace)
 	fmt.Fprintf(os.Stderr, "removed: [%d]\n", id)
 }
 
@@ -680,7 +692,7 @@ func cmdClean() {
 	db := openDB()
 	defer db.Close()
 
-	result, err := db.Exec("DELETE FROM "+tableName()+" WHERE status IN ('done', 'killed')")
+	result, err := db.Exec("DELETE FROM jobs WHERE ns = ? AND status IN ('done', 'killed')", namespace)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to clean: %v\n", err)
 		os.Exit(1)
@@ -700,7 +712,7 @@ func cmdCat(idStr string) {
 	defer db.Close()
 
 	var command, argsJSON, workdir, envJSON string
-	err = db.QueryRow("SELECT command, args, workdir, env FROM "+tableName()+" WHERE id = ?", id).
+	err = db.QueryRow("SELECT command, args, workdir, env FROM jobs WHERE id = ? AND ns = ?", id, namespace).
 		Scan(&command, &argsJSON, &workdir, &envJSON)
 	if err == sql.ErrNoRows {
 		fmt.Fprintf(os.Stderr, "job not found: %d\n", id)
@@ -764,7 +776,8 @@ type Job struct {
 
 func getNextJob(db *sql.DB) (*Job, error) {
 	row := db.QueryRow(
-		"SELECT id, command, args, workdir, env FROM " + tableName() + " WHERE status = 'pending' ORDER BY id ASC LIMIT 1",
+		"SELECT id, command, args, workdir, env FROM jobs WHERE ns = ? AND status = 'pending' ORDER BY id ASC LIMIT 1",
+		namespace,
 	)
 
 	var job Job
