@@ -1,38 +1,27 @@
 // cq - Command Queue
 //
-// A job queue that runs commands sequentially using zmx (terminal multiplexer).
+// A job queue that runs commands sequentially using tmux as the terminal
+// backend. cq talks to a dedicated tmux server on socket "cq" so its
+// sessions never collide with the user's regular tmux work.
 //
 // Architecture:
-//   - Jobs are stored in SQLite (single `jobs` table, namespaced via the `ns`
-//     column).
+//   - Jobs are stored in SQLite (single `jobs` table, namespaced via `ns`).
 //   - A single worker process per namespace pulls pending jobs and runs each
-//     in its own zmx session. The worker is spawned on demand by `cq <cmd>`
-//     (detached via Setsid) and exits after a short idle timeout. Mutual
-//     exclusion is enforced with an flock on the namespace lock file.
-//   - The worker polls `zmx list` to detect session completion; no in-session
-//     callback is required.
-//   - Each job runs inside its own zmx session, enabling:
-//     1. Detached execution: jobs continue running even without a terminal
-//     2. Later attachment: `cq attach <id>` connects your terminal to the job
-//     3. Scrollback history: `cq log <id>` retrieves output via `zmx history`
-//
-// Shell quoting through zmx:
-//   `zmx run <session> <argv...>` does not exec argv directly — it joins the
-//   trailing argv with spaces and feeds the whole thing to a shell. Different
-//   zmx builds disagree on whether to %q-quote each argv element first (the
-//   nix flake build does; some local builds do not). To dodge that, we write
-//   the wrapped command to a script file in the state dir and invoke it as
-//   `sh <path>` — both tokens are quote-safe so they survive any join/quote
-//   variation untouched. The worker removes the script when the job is done.
+//     in its own tmux session (`cq-<ns>-<id>`). The worker is spawned on
+//     demand by `cq <cmd>` (detached via Setsid) and exits after a short
+//     idle timeout. Mutual exclusion: flock on the namespace lock file.
+//   - tmux has no built-in exit-code metadata, so each job's wrapper script
+//     writes `$?` to a sentinel file (`<ns>-<id>.exit`). The worker polls
+//     for that file. `remain-on-exit on` keeps the dead pane around so the
+//     worker can `capture-pane` for scrollback before killing the session.
+//   - Per-job tmux session enables:
+//     1. Detached execution: jobs survive without a terminal
+//     2. Later attachment: `cq attach <id>` → `tmux -L cq attach -t ...`
+//     3. Scrollback: `cq log <id>` via `tmux capture-pane`
 //
 // Remote execution:
 //   `cq --host <ssh-target> ...` execs ssh and runs cq on the remote host,
 //   forwarding the namespace and remaining args. `attach` allocates a TTY.
-//
-// zmx fallback:
-//   If `zmx` is not on PATH, cq falls back to
-//   `nix --extra-experimental-features 'nix-command flakes' run github:neurosnap/zmx -- <args>`,
-//   so a host with nix but no zmx still works.
 
 package main
 
@@ -191,19 +180,13 @@ flags:
 	os.Exit(1)
 }
 
-// zmxArgs returns the command and args to invoke zmx.
-// Falls back to `nix run github:neurosnap/zmx --` if zmx is not in PATH.
-func zmxArgs(args ...string) (string, []string) {
-	if _, err := exec.LookPath("zmx"); err == nil {
-		return "zmx", args
-	}
-	nixArgs := []string{"--extra-experimental-features", "nix-command flakes", "run", "github:neurosnap/zmx", "--"}
-	return "nix", append(nixArgs, args...)
-}
+// tmuxSocket is the dedicated tmux server name cq uses, so its sessions
+// don't collide with the user's regular tmux work.
+const tmuxSocket = "cq"
 
-func zmxExec(args ...string) *exec.Cmd {
-	bin, fullArgs := zmxArgs(args...)
-	return exec.Command(bin, fullArgs...)
+func tmuxExec(args ...string) *exec.Cmd {
+	full := append([]string{"-L", tmuxSocket}, args...)
+	return exec.Command("tmux", full...)
 }
 
 func jobSession(id int64) string {
@@ -212,6 +195,10 @@ func jobSession(id int64) string {
 
 func jobScriptPath(id int64) string {
 	return filepath.Join(getStateDir(), fmt.Sprintf("%s-%d.sh", namespace, id))
+}
+
+func jobExitPath(id int64) string {
+	return filepath.Join(getStateDir(), fmt.Sprintf("%s-%d.exit", namespace, id))
 }
 
 func openDB() *sql.DB {
@@ -351,12 +338,15 @@ func cmdWorker() {
 	}
 }
 
-// runJob executes a single job: marks it running, spawns its zmx session,
+// runJob executes a single job: marks it running, spawns its tmux session,
 // polls until completion, then records the result and saves scrollback.
 func runJob(db *sql.DB, job *Job) {
 	db.Exec("UPDATE jobs SET status = 'running', started_at = ? WHERE id = ?", time.Now(), job.ID)
 
 	sessionName := jobSession(job.ID)
+	scriptPath := jobScriptPath(job.ID)
+	exitPath := jobExitPath(job.ID)
+	os.Remove(exitPath) // clear any stale sentinel
 
 	userCmd := shellQuote(job.Command)
 	for _, a := range job.Args {
@@ -366,61 +356,52 @@ func runJob(db *sql.DB, job *Job) {
 	if len(job.Args) > 0 {
 		display += " " + strings.Join(job.Args, " ")
 	}
-	// Echo the command first so `cq attach` / `cq log` shows what's running.
 	// The subshell wraps the user command so a builtin `exit` doesn't kill
-	// zmx's shell before we can capture the exit code.
-	shellCmd := "echo " + shellQuote("$ "+display) + "\n(" + userCmd + ")\n"
-
-	scriptPath := jobScriptPath(job.ID)
+	// the wrapping shell before we can capture the exit code. We write the
+	// exit code to a sentinel file the worker polls; tmux itself doesn't
+	// expose exit codes in its session metadata.
+	shellCmd := "echo " + shellQuote("$ "+display) + "\n"
+	shellCmd += "(" + userCmd + ")\n"
+	shellCmd += "echo $? > " + shellQuote(exitPath) + "\n"
 	os.WriteFile(scriptPath, []byte(shellCmd), 0644)
 
-	cmd := zmxExec("run", sessionName, "sh", scriptPath)
+	// Start a detached tmux session with remain-on-exit so the dead pane
+	// sticks around for capture-pane after the command finishes.
+	cmd := tmuxExec("new-session", "-d", "-s", sessionName, "sh", scriptPath)
 	cmd.Dir = job.Workdir
 	cmd.Env = job.Env
-	devNull, _ := os.OpenFile(os.DevNull, os.O_RDWR, 0)
-	if devNull != nil {
-		cmd.Stdin = devNull
-		cmd.Stdout = devNull
-		cmd.Stderr = devNull
-		defer devNull.Close()
-	}
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-	if err := cmd.Start(); err != nil {
+	if err := cmd.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to start tmux session %s: %v\n", sessionName, err)
 		db.Exec("UPDATE jobs SET status = 'done', exit_code = -1, finished_at = ? WHERE id = ?", time.Now(), job.ID)
 		os.Remove(scriptPath)
 		return
 	}
-	cmd.Process.Release()
+	tmuxExec("set-option", "-t", sessionName, "remain-on-exit", "on").Run()
 
-	// Wait for the session to register and capture its pid.
-	for i := 0; i < 40; i++ {
-		if s := getSession(sessionName); s != nil && s.pid > 0 {
-			db.Exec("UPDATE jobs SET pid = ? WHERE id = ?", s.pid, job.ID)
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
+	// Record the session's pid (the wrapping sh).
+	if s := getSession(sessionName); s != nil && s.pid > 0 {
+		db.Exec("UPDATE jobs SET pid = ? WHERE id = ?", s.pid, job.ID)
 	}
 
-	// Poll until zmx reports the task as ended (or the session vanishes).
+	// Poll for the exit sentinel or the session disappearing (e.g. killed).
 	exitCode := -1
 	for {
-		s := getSession(sessionName)
-		if s == nil {
+		if data, err := os.ReadFile(exitPath); err == nil {
+			fmt.Sscanf(strings.TrimSpace(string(data)), "%d", &exitCode)
 			break
 		}
-		if s.ended {
-			exitCode = s.exitCode
-			break
+		if getSession(sessionName) == nil {
+			break // session gone without writing exit (likely killed)
 		}
-		time.Sleep(500 * time.Millisecond)
+		time.Sleep(300 * time.Millisecond)
 	}
 
-	// Save scrollback while the session still exists.
-	if logOutput, err := zmxExec("history", sessionName).Output(); err == nil {
+	// Capture scrollback while the session is still alive (remain-on-exit).
+	if logOutput, err := tmuxExec("capture-pane", "-p", "-S", "-", "-t", sessionName).Output(); err == nil {
 		db.Exec("UPDATE jobs SET log = ? WHERE id = ?", string(logOutput), job.ID)
 	}
 
-	// If the user already marked the job killed, preserve that status.
+	// Preserve a 'killed' status set by cmdKill; otherwise mark done.
 	var status string
 	db.QueryRow("SELECT status FROM jobs WHERE id = ?", job.ID).Scan(&status)
 	if status != "killed" {
@@ -432,7 +413,8 @@ func runJob(db *sql.DB, job *Job) {
 	}
 
 	os.Remove(scriptPath)
-	zmxExec("kill", sessionName).Run() // best-effort cleanup; harmless if already gone
+	os.Remove(exitPath)
+	tmuxExec("kill-session", "-t", sessionName).Run() // tear down the parked pane
 	notifyDone(job.ID, exitCode)
 }
 
@@ -502,13 +484,12 @@ func cmdAttach(idStr string) {
 	}
 
 	sessionName := jobSession(int64(id))
-	bin, fullArgs := zmxArgs("attach", sessionName)
-	binPath, err := exec.LookPath(bin)
+	tmuxBin, err := exec.LookPath("tmux")
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s not found: %v\n", bin, err)
+		fmt.Fprintf(os.Stderr, "tmux not found: %v\n", err)
 		os.Exit(1)
 	}
-	syscall.Exec(binPath, append([]string{bin}, fullArgs...), os.Environ())
+	syscall.Exec(tmuxBin, []string{"tmux", "-L", tmuxSocket, "attach", "-t", sessionName}, os.Environ())
 }
 
 func cmdLog(idStr string) {
@@ -522,7 +503,7 @@ func cmdLog(idStr string) {
 
 	// Try live session first, fall back to saved log
 	if getSession(sessionName) != nil {
-		cmd := zmxExec( "history", sessionName)
+		cmd := tmuxExec("capture-pane", "-p", "-S", "-", "-t", sessionName)
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
 		cmd.Run()
@@ -551,7 +532,7 @@ func cmdKill(idStr string) {
 	}
 
 	sessionName := jobSession(int64(id))
-	cmd := zmxExec( "kill", sessionName)
+	cmd := tmuxExec("kill-session", "-t", sessionName)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
@@ -796,32 +777,23 @@ func getNextJob(db *sql.DB) (*Job, error) {
 }
 
 type sessionInfo struct {
-	pid      int
-	ended    bool
-	exitCode int
+	pid int
 }
 
-// getSession queries zmx for a session's state.
-// Returns nil if session doesn't exist.
+// getSession returns metadata for a tmux session, or nil if it doesn't
+// exist. The pid is the session's first pane's running command.
 func getSession(sessionName string) *sessionInfo {
-	output, err := zmxExec( "list").Output()
+	out, err := tmuxExec("list-sessions", "-F", "#{session_name}\t#{pane_pid}").Output()
 	if err != nil {
 		return nil
 	}
-	for _, line := range strings.Split(string(output), "\n") {
-		if !strings.Contains(line, "session_name="+sessionName+"\t") {
+	prefix := sessionName + "\t"
+	for _, line := range strings.Split(string(out), "\n") {
+		if !strings.HasPrefix(line, prefix) {
 			continue
 		}
 		info := &sessionInfo{}
-		for _, part := range strings.Split(line, "\t") {
-			if strings.HasPrefix(part, "pid=") {
-				info.pid, _ = strconv.Atoi(strings.TrimPrefix(part, "pid="))
-			} else if strings.HasPrefix(part, "task_ended_at=") {
-				info.ended = true
-			} else if strings.HasPrefix(part, "task_exit_code=") {
-				info.exitCode, _ = strconv.Atoi(strings.TrimPrefix(part, "task_exit_code="))
-			}
-		}
+		info.pid, _ = strconv.Atoi(strings.TrimPrefix(line, prefix))
 		return info
 	}
 	return nil
