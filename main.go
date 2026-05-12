@@ -152,6 +152,8 @@ func main() {
 			os.Exit(1)
 		}
 		cmdCat(args[1])
+	case "doctor":
+		cmdDoctor()
 	default:
 		cmdQueue(args)
 	}
@@ -172,6 +174,7 @@ commands:
   reset               clear all jobs in namespace
   resume              start processing pending jobs
   cat <job-id>        show job command with workdir and env
+  doctor              show worker / lock / tmux state for this namespace
 
 flags:
   -n, --namespace     job queue namespace (default: "default", or CQ_NS env)
@@ -718,6 +721,114 @@ func cmdCat(idStr string) {
 		cmdStr += " " + shellQuote(a)
 	}
 	fmt.Printf("%s\n", cmdStr)
+}
+
+// cmdDoctor prints diagnostic info about the queue's runtime state:
+// worker process, lock holder, tmux sessions, currently-running job, and
+// any leftover state files. Useful when the queue appears stuck.
+func cmdDoctor() {
+	fmt.Printf("namespace: %s\n", namespace)
+	fmt.Printf("state dir: %s\n", getStateDir())
+	fmt.Printf("lock file: %s\n", lockFile)
+
+	// Lock holder.
+	lock, err := os.OpenFile(lockFile, os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		fmt.Printf("lock: cannot open (%v)\n", err)
+	} else {
+		if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+			fmt.Printf("lock: HELD by another process\n")
+		} else {
+			fmt.Printf("lock: free\n")
+			syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+		}
+		lock.Close()
+	}
+
+	// Worker process(es) for this namespace.
+	pgrep := exec.Command("pgrep", "-af", "cq.*--worker")
+	out, _ := pgrep.Output()
+	var workers []string
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if line == "" {
+			continue
+		}
+		// Filter by namespace flag.
+		if strings.Contains(line, "-n "+namespace) || (namespace == "default" && !strings.Contains(line, "-n ")) {
+			workers = append(workers, line)
+		}
+	}
+	if len(workers) == 0 {
+		fmt.Printf("worker: not running\n")
+	} else {
+		fmt.Printf("worker: %d process(es)\n", len(workers))
+		for _, w := range workers {
+			fmt.Printf("  %s\n", w)
+		}
+	}
+
+	// DB state: running + pending counts, currently-running job.
+	db := openDB()
+	defer db.Close()
+	var running, pending int
+	db.QueryRow("SELECT COUNT(*) FROM jobs WHERE ns = ? AND status = 'running'", namespace).Scan(&running)
+	db.QueryRow("SELECT COUNT(*) FROM jobs WHERE ns = ? AND status = 'pending'", namespace).Scan(&pending)
+	fmt.Printf("jobs: running=%d pending=%d\n", running, pending)
+
+	rows, err := db.Query("SELECT id, command, args, started_at FROM jobs WHERE ns = ? AND status = 'running' ORDER BY id", namespace)
+	if err == nil {
+		for rows.Next() {
+			var id int64
+			var command, argsJSON string
+			var startedAt sql.NullTime
+			rows.Scan(&id, &command, &argsJSON, &startedAt)
+			var args []string
+			json.Unmarshal([]byte(argsJSON), &args)
+			cmdStr := command
+			if len(args) > 0 {
+				cmdStr += " " + strings.Join(args, " ")
+			}
+			started := "?"
+			if startedAt.Valid {
+				started = startedAt.Time.Local().Format("2006-01-02 15:04:05")
+			}
+			fmt.Printf("  running [%d] since %s: %s\n", id, started, cmdStr)
+			// Sentinel + script files for this job.
+			scriptPath := jobScriptPath(id)
+			exitPath := jobExitPath(id)
+			if _, err := os.Stat(scriptPath); err == nil {
+				fmt.Printf("    script: %s\n", scriptPath)
+			}
+			if data, err := os.ReadFile(exitPath); err == nil {
+				fmt.Printf("    exit file present: %s (%s)\n", exitPath, strings.TrimSpace(string(data)))
+			} else {
+				fmt.Printf("    exit file: not yet written\n")
+			}
+		}
+		rows.Close()
+	}
+
+	// Live tmux sessions on cq's socket.
+	tout, err := tmuxExec("list-sessions", "-F", "#{session_name}\t#{session_attached}\t#{pane_pid}\t#{session_created}").Output()
+	if err != nil {
+		fmt.Printf("tmux: no server on socket %q (or no sessions)\n", tmuxSocket)
+	} else {
+		var lines []string
+		prefix := fmt.Sprintf("cq-%s-", namespace)
+		for _, line := range strings.Split(strings.TrimSpace(string(tout)), "\n") {
+			if strings.HasPrefix(line, prefix) {
+				lines = append(lines, line)
+			}
+		}
+		if len(lines) == 0 {
+			fmt.Printf("tmux: no sessions for namespace %q\n", namespace)
+		} else {
+			fmt.Printf("tmux sessions:\n")
+			for _, line := range lines {
+				fmt.Printf("  %s\n", line)
+			}
+		}
+	}
 }
 
 // shortenPath abbreviates a path: replaces $HOME with ~, shortens
